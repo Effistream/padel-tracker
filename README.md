@@ -5,8 +5,13 @@ Hlídá volné kurty na padel v areálu Císařská louka
 a pošle Telegram zprávu, když se dříve plně obsazený termín uvolní —
 tedy když někdo zruší rezervaci.
 
-Běží zdarma na GitHub Actions každých ~5–12 minut (cron `*/5` s rozptylem
+Běží zdarma na GitHub Actions každých ~5–12 minut (cron s rozptylem
 GitHub scheduleru). Stav mezi běhy se ukládá do `state.json` v tomto repu.
+
+Protože GitHub u nových repozitářů spouští cron se zpožděním (i hodiny),
+existuje záložní [bridge.yml](.github/workflows/bridge.yml) — samořetězící
+workflow, které kontroluje kurty po 5 minutách a samo se ukončí, jakmile
+nativní cron začne běhat. Zastavení: zrušit jeho aktuální run v Actions.
 
 ## Zprovoznění
 
