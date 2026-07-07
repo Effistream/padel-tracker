@@ -46,7 +46,8 @@ jobs:
                 echo "Push selhal (pokus $attempt)"; sleep 5
               done
             fi
-            [ "$i" -lt 12 ] && sleep 300
+            # pozor: `[ ... ] && sleep` by u poslední iterace vrátil exit 1
+            if [ "$i" -lt 12 ]; then sleep 300; fi
           done
 
       - name: Předat štafetu, nebo pokračovat
