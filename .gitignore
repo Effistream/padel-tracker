@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .playwright-mcp/
 .claude/
+.DS_Store
