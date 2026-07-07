@@ -55,14 +55,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          last=$(gh api "repos/${{ github.repository }}/actions/runs?event=schedule&per_page=1" \
-                 --jq '.workflow_runs[0].created_at // empty')
-          if [ -n "$last" ]; then
-            age=$(( $(date -u +%s) - $(date -u -d "$last" +%s) ))
-            if [ "$age" -lt 1200 ]; then
-              echo "Nativní cron žije (poslední run před ${age}s) — můstek končí."
+          # jeden osamělý scheduled run nestačí (scheduler umí vystřelit
+          # jednou a zase usnout) — chceme 2 runy během 25 minut = kadenci
+          dates=$(gh api "repos/${{ github.repository }}/actions/runs?event=schedule&per_page=2" \
+                  --jq '.workflow_runs[].created_at')
+          if [ "$(echo "$dates" | grep -c .)" -ge 2 ]; then
+            oldest=$(echo "$dates" | tail -1)
+            age=$(( $(date -u +%s) - $(date -u -d "$oldest" +%s) ))
+            if [ "$age" -lt 1500 ]; then
+              echo "Nativní cron má kadenci (2 runy během ${age}s) — můstek končí."
               exit 0
             fi
           fi
-          echo "Nativní cron stále nespouští — spouštím další hodinu můstku."
+          echo "Nativní cron stále nejede spolehlivě — spouštím další hodinu můstku."
           gh workflow run bridge.yml --repo "${{ github.repository }}"
