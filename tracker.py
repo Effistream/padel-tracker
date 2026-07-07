@@ -80,10 +80,20 @@ def parse_utc(iso):
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
+def parse_duration(text):
+    """Reenio doba "1:00:00" / "2400:00:00" (H:MM:SS) → timedelta."""
+    try:
+        hours, minutes, seconds = (int(p) for p in text.split(":"))
+        return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+    except (ValueError, AttributeError):
+        return timedelta(0)
+
+
 def build_slots(events, now):
     """Mapa {"YYYY-MM-DDTHH:MM": počet volných kurtů} po 30min slotech.
 
-    Počítá jen budoucí sloty; klíče jsou v lokálním čase Europe/Prague.
+    Počítá jen sloty, které lze ještě rezervovat (Reenio uzavírá rezervace
+    reservationDueDate před začátkem slotu); klíče jsou v čase Europe/Prague.
     """
     slots = {}
     for event in events:
@@ -94,6 +104,7 @@ def build_slots(events, now):
             continue
         start = parse_utc(event["start"])
         end = parse_utc(event["end"])
+        due = parse_duration(event.get("reservationDueDate") or "")
         reservations = [
             (parse_utc(r["start"]), parse_utc(r["end"]), r.get("capacity", 1))
             for r in event.get("reservations") or []
@@ -102,7 +113,7 @@ def build_slots(events, now):
         step = timedelta(minutes=SLOT_MINUTES)
         while slot < end:
             slot_end = slot + step
-            if slot >= now:
+            if slot > now + due:
                 occupied = sum(c for s, e, c in reservations if s < slot_end and e > slot)
                 key = slot.astimezone(TZ).strftime("%Y-%m-%dT%H:%M")
                 slots[key] = slots.get(key, 0) + max(0, capacity - occupied)
@@ -147,7 +158,9 @@ def parse_days(spec):
 def parse_time(text):
     """"16:00" nebo "16" → minuty od půlnoci. None při chybě."""
     hh, _, mm = text.partition(":")
-    if not hh.isdigit() or (mm and not mm.isdigit()):
+    # isdigit() nestačí — pustí i unicode číslice (²), na kterých int() padá
+    digits = "0123456789"
+    if not hh or any(c not in digits for c in hh + mm):
         return None
     hours, minutes = int(hh), int(mm or 0)
     if hours > 24 or minutes > 59 or (hours == 24 and minutes > 0):
@@ -346,7 +359,13 @@ def process_updates(state, slots, tg):
                 continue
         if chat_id != state["chat_id"]:
             continue  # cizí chaty ignorujeme
-        handle_command(text, state, slots, tg)
+        try:
+            handle_command(text, state, slots, tg)
+        except Exception as exc:
+            # pád tady by zablokoval posun offsetu a příkaz by se
+            # přehrával každý běh znovu (crash-loop až 24 h)
+            print(f"Zpracování příkazu {text!r} selhalo: {exc}", file=sys.stderr)
+            tg.send(state["chat_id"], "⚠️ Příkaz se nepodařilo zpracovat.")
 
 
 # ---------------------------------------------------------------- hlavní běh
@@ -376,6 +395,12 @@ def main():
     tg = Telegram(os.environ.get("TELEGRAM_BOT_TOKEN", ""))
     now = datetime.now(timezone.utc)
 
+    if os.environ.get("GITHUB_ACTIONS") and not tg.token:
+        message = "TELEGRAM_BOT_TOKEN není nastaven (Settings → Secrets → Actions)."
+        if state["chat_id"]:
+            sys.exit(message)  # bot už běžel — tichý dry-run by byl výpadek
+        print(f"::warning::{message}")
+
     events = fetch_events(now.astimezone(TZ).strftime("%Y-%m-%d"))
     slots = build_slots(events, now)
     print(f"Načteno {len(events)} termínů, {len(slots)} slotů, "
@@ -394,6 +419,13 @@ def main():
         print(message)
         if state["chat_id"] and not state["paused"]:
             tg.send(state["chat_id"], message)
+
+    # 0-baseline slotů, které z feedu dočasně zmizely (deaktivovaný event,
+    # výpadek API), zůstává — jinak by se návrat s volnou kapacitou nenahlásil
+    now_key = now.astimezone(TZ).strftime("%Y-%m-%dT%H:%M")
+    for key, count in old_slots.items():
+        if count == 0 and key > now_key and key not in slots:
+            slots[key] = 0
 
     state["slots"] = slots
     state["updated"] = now.astimezone(TZ).isoformat(timespec="seconds")

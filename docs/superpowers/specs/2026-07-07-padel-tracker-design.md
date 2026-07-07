@@ -61,7 +61,26 @@ a poslat Telegram notifikaci, když se dříve plně obsazený slot uvolní
 
 - Selhání API / neplatná odpověď → skript skončí nenulově, GitHub pošle
   e-mail o selhání workflow; další běh pokračuje z posledního stavu.
-- Souběh běhů řeší `concurrency` skupina; push stavu s `pull --rebase` před pushem.
+- Souběh běhů řeší `concurrency` skupina; push stavu s `pull --rebase -X theirs`
+  a retry smyčkou (race s ručním pushem do main).
+- Chyba při zpracování jednoho Telegram příkazu se odchytí (jinak by
+  neposunutý offset přehrával tentýž příkaz každý běh — crash-loop).
+- Sloty se počítají jen do uzávěrky rezervací (`reservationDueDate`,
+  30–60 min před začátkem) — nenotifikujeme nezarezervovatelné sloty.
+- 0-baseline slotů dočasně zmizelých z feedu (deaktivace, výpadek) se drží,
+  aby se návrat s volnou kapacitou nahlásil.
+- Chybějící `TELEGRAM_BOT_TOKEN` v CI: warning dokud se bot nepřipojil,
+  poté tvrdé selhání (tichý dry-run by byl neviditelný výpadek).
+
+## Akceptované trade-offy
+
+- Latence reakcí bota = interval cronu (~5–12 min).
+- Doručení at-least-once: selže-li uložení stavu po odeslání zpráv, další
+  běh může zprávu/odpověď poslat podruhé. Duplicita je přijatelnější než
+  ztráta notifikace.
+- Veřejné repo: ve `state.json` je vidět chat_id a filtry (bez bot tokenu
+  nezneužitelné); token je jen v GitHub Secrets.
+- Commit historie roste (~1 commit na běh se změnou obsazenosti).
 
 ## Implementační plán
 
