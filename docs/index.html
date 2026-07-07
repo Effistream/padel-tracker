@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Filtry — Padel tracker</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #1a2a38);
+    --text: var(--tg-theme-text-color, #f2f5f7);
+    --hint: var(--tg-theme-hint-color, #8fa3b0);
+    --accent: var(--tg-theme-button-color, #337ab7);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --card: var(--tg-theme-secondary-bg-color, #23374a);
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 16px 16px 96px;
+  }
+  h1 { font-size: 1.15rem; margin-bottom: 4px; }
+  .hint { color: var(--hint); font-size: 0.82rem; line-height: 1.35; }
+  section { margin-top: 18px; }
+  h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em;
+       color: var(--hint); margin-bottom: 8px; }
+  #filter-list:empty::after {
+    content: "Žádné filtry — notifikace chodí na všechny časy.";
+    color: var(--hint); font-size: 0.85rem;
+  }
+  .filter-item {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--card); border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 6px; font-size: 0.95rem;
+  }
+  .filter-item button {
+    background: none; border: none; color: var(--hint);
+    font-size: 1.1rem; padding: 2px 6px; cursor: pointer;
+  }
+  .days { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    flex: 1 0 40px; padding: 9px 0; text-align: center;
+    background: var(--card); color: var(--text);
+    border: 1px solid transparent; border-radius: 10px;
+    font-size: 0.9rem; cursor: pointer; user-select: none;
+  }
+  .chip.on { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+  .shortcuts { display: flex; gap: 6px; margin-top: 8px; }
+  .shortcuts .chip { flex: 1; font-size: 0.82rem; }
+  .times { display: flex; gap: 10px; align-items: center; margin-top: 4px; }
+  .times label { font-size: 0.85rem; color: var(--hint); display: block; margin-bottom: 4px; }
+  .times > div { flex: 1; }
+  select {
+    width: 100%; padding: 10px; border-radius: 10px; border: none;
+    background: var(--card); color: var(--text); font-size: 1rem;
+    appearance: none; text-align: center;
+  }
+  #add {
+    width: 100%; margin-top: 12px; padding: 12px; border: none;
+    border-radius: 10px; background: var(--card); color: var(--text);
+    font-size: 1rem; font-weight: 600; cursor: pointer;
+  }
+  #save-fallback {
+    position: fixed; left: 16px; right: 16px; bottom: 16px;
+    padding: 14px; border: none; border-radius: 12px;
+    background: var(--accent); color: var(--accent-text);
+    font-size: 1.05rem; font-weight: 700; cursor: pointer;
+  }
+  #banner {
+    background: #7a3b3b; color: #fff; border-radius: 10px;
+    padding: 10px 12px; font-size: 0.85rem; margin-bottom: 14px; display: none;
+  }
+  .err { color: #e08a8a; font-size: 0.85rem; margin-top: 8px; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<div id="banner">Stránka není otevřená v Telegramu — uložení nebude fungovat.
+  Otevřete ji tlačítkem <b>⚙️ Filtry</b> v chatu s botem.</div>
+
+<h1>🎾 Filtry notifikací</h1>
+<p class="hint">Notifikace o uvolněných kurtech přijdou jen v časech níže.
+Prázdný seznam = hlásí se všechno. Uložení nahradí všechny filtry.</p>
+
+<section>
+  <h2>Aktivní filtry</h2>
+  <div id="filter-list"></div>
+</section>
+
+<section>
+  <h2>Přidat filtr</h2>
+  <div class="days" id="days"></div>
+  <div class="shortcuts">
+    <div class="chip" id="sc-week">Po–Pá</div>
+    <div class="chip" id="sc-weekend">Víkend</div>
+    <div class="chip" id="sc-all">Každý den</div>
+  </div>
+  <div class="times">
+    <div><label for="from">Od</label><select id="from"></select></div>
+    <div><label for="to">Do</label><select id="to"></select></div>
+  </div>
+  <button id="add">➕ Přidat filtr</button>
+  <div class="err" id="err"></div>
+</section>
+
+<button id="save-fallback" hidden>💾 Uložit filtry</button>
+
+<script>
+"use strict";
+const DAY_NAMES = ["Po", "Út", "St", "Čt", "Pá", "So", "Ne"];
+const STATE_URL = "https://raw.githubusercontent.com/Effistream/padel-tracker/main/state.json";
+const tg = window.Telegram && window.Telegram.WebApp;
+const inTelegram = !!(tg && tg.initData);
+
+let filters = [];
+const selectedDays = new Set([0, 1, 2, 3, 4]);
+
+function timeLabel(min) {
+  return Math.floor(min / 60) + ":" + String(min % 60).padStart(2, "0");
+}
+
+function daysLabel(days) {
+  // souvislé úseky sbal do rozsahů: [0,1,2,3,4] → "Po–Pá"
+  const parts = [];
+  for (let i = 0; i < days.length; i++) {
+    let j = i;
+    while (j + 1 < days.length && days[j + 1] === days[j] + 1) j++;
+    parts.push(j > i + 1 ? DAY_NAMES[days[i]] + "–" + DAY_NAMES[days[j]]
+                         : days.slice(i, j + 1).map(d => DAY_NAMES[d]).join(", "));
+    i = j;
+  }
+  return parts.join(", ");
+}
+
+function filterLabel(f) {
+  const time = (f.from === 0 && f.to === 1440)
+    ? "celý den" : timeLabel(f.from) + "–" + timeLabel(f.to);
+  return daysLabel(f.days) + " · " + time;
+}
+
+function render() {
+  const list = document.getElementById("filter-list");
+  list.innerHTML = "";
+  filters.forEach((f, i) => {
+    const row = document.createElement("div");
+    row.className = "filter-item";
+    const label = document.createElement("span");
+    label.textContent = filterLabel(f);
+    const del = document.createElement("button");
+    del.textContent = "✕";
+    del.onclick = () => { filters.splice(i, 1); render(); };
+    row.append(label, del);
+    list.append(row);
+  });
+  document.querySelectorAll("#days .chip").forEach((chip, d) =>
+    chip.classList.toggle("on", selectedDays.has(d)));
+  const saveText = filters.length
+    ? `💾 Uložit filtry (${filters.length})` : "💾 Uložit (bez filtrů = vše)";
+  if (inTelegram) {
+    tg.MainButton.setText(saveText);
+    tg.MainButton.show();
+  } else {
+    const btn = document.getElementById("save-fallback");
+    btn.hidden = false;
+    btn.textContent = saveText;
+  }
+}
+
+function save() {
+  if (!inTelegram) return;
+  tg.sendData(JSON.stringify({ filters }));
+}
+
+// --- init ---
+if (inTelegram) { tg.ready(); tg.expand(); tg.MainButton.onClick(save); }
+else document.getElementById("banner").style.display = "block";
+
+const daysBox = document.getElementById("days");
+DAY_NAMES.forEach((name, d) => {
+  const chip = document.createElement("div");
+  chip.className = "chip";
+  chip.textContent = name;
+  chip.onclick = () => {
+    selectedDays.has(d) ? selectedDays.delete(d) : selectedDays.add(d);
+    render();
+  };
+  daysBox.append(chip);
+});
+const setDays = days => { selectedDays.clear(); days.forEach(d => selectedDays.add(d)); render(); };
+document.getElementById("sc-week").onclick = () => setDays([0, 1, 2, 3, 4]);
+document.getElementById("sc-weekend").onclick = () => setDays([5, 6]);
+document.getElementById("sc-all").onclick = () => setDays([0, 1, 2, 3, 4, 5, 6]);
+
+for (const sel of [document.getElementById("from"), document.getElementById("to")]) {
+  for (let m = 0; m <= 1440; m += 30) {
+    if ((sel.id === "from" && m === 1440) || (sel.id === "to" && m === 0)) continue;
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = timeLabel(m);
+    sel.append(opt);
+  }
+}
+document.getElementById("from").value = 960;   // 16:00
+document.getElementById("to").value = 1320;    // 22:00
+
+document.getElementById("add").onclick = () => {
+  const from = +document.getElementById("from").value;
+  const to = +document.getElementById("to").value;
+  const err = document.getElementById("err");
+  if (!selectedDays.size) { err.textContent = "Vyberte aspoň jeden den."; return; }
+  if (from >= to) { err.textContent = "Čas Od musí být dřív než Do."; return; }
+  err.textContent = "";
+  filters.push({ days: [...selectedDays].sort((a, b) => a - b), from, to });
+  render();
+};
+document.getElementById("save-fallback").onclick = save;
+
+fetch(STATE_URL, { cache: "no-store" })
+  .then(r => r.json())
+  .then(s => { if (Array.isArray(s.filters)) filters = s.filters; render(); })
+  .catch(() => render());
+render();
+</script>
+</body>
+</html>

@@ -21,7 +21,13 @@ GitHub scheduleru). Stav mezi běhy se ukládá do `state.json` v tomto repu.
 3. **Napište svému botovi `/start`** v Telegramu. Při nejbližším běhu se bot
    uzamkne na váš chat a pošle nápovědu. Zprávy z jiných chatů ignoruje.
 
-## Příkazy bota
+## Ovládání bota
+
+Filtry nejpohodlněji nastavíte tlačítkem **⚙️ Filtry** u pole zprávy —
+otevře Mini App (hostovanou na GitHub Pages z `docs/`) s výběrem dnů
+a časů. Uložení nahradí celý seznam filtrů.
+
+Textové příkazy:
 
 | Příkaz | Význam |
 |---|---|

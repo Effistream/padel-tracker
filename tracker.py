@@ -30,12 +30,29 @@ SLOT_MINUTES = 30
 TZ = ZoneInfo("Europe/Prague")
 STATE_FILE = Path(__file__).parent / "state.json"
 
+WEBAPP_URL = "https://effistream.github.io/padel-tracker/"
+FILTER_KEYBOARD = {
+    "keyboard": [[{"text": "⚙️ Filtry", "web_app": {"url": WEBAPP_URL}}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+BOT_COMMANDS = [
+    {"command": "volno", "description": "Přehled volných slotů na 7 dní"},
+    {"command": "filtry", "description": "Vypsat aktivní filtry"},
+    {"command": "filtr", "description": "Přidat filtr, např. /filtr po-pa 16:00-22:00"},
+    {"command": "smazfiltry", "description": "Smazat všechny filtry"},
+    {"command": "pauza", "description": "Pozastavit notifikace"},
+    {"command": "start", "description": "Obnovit notifikace / nápověda"},
+    {"command": "help", "description": "Nápověda"},
+]
+
 DAY_NAMES = ["Po", "Út", "St", "Čt", "Pá", "So", "Ne"]
 DAY_TOKENS = {"po": 0, "ut": 1, "st": 2, "ct": 3, "pa": 4, "so": 5, "ne": 6}
 DAY_ALIASES = {"vikend": [5, 6], "vsedni": [0, 1, 2, 3, 4]}
 
 HELP_TEXT = (
     "🎾 Padel tracker — hlídám uvolněné kurty (Císařská louka).\n\n"
+    "Filtry nejpohodlněji nastavíte tlačítkem ⚙️ Filtry dole u pole zprávy.\n\n"
     "Příkazy:\n"
     "/filtr po-pa 16:00-22:00 — přidat časový filtr notifikací\n"
     "/filtr so,ne — přidat filtr (bez času = celý den)\n"
@@ -288,13 +305,14 @@ class Telegram:
             raise RuntimeError(f"Telegram {method} selhalo: {payload}")
         return payload["result"]
 
-    def send(self, chat_id, text):
+    def send(self, chat_id, text, **extra):
         try:
             self.call(
                 "sendMessage",
                 chat_id=chat_id,
                 text=text,
                 disable_web_page_preview=True,
+                **extra,
             )
         except Exception as exc:  # neshodit celý běh kvůli jedné zprávě
             print(f"sendMessage selhalo: {exc}", file=sys.stderr)
@@ -308,9 +326,9 @@ def handle_command(text, state, slots, tg):
 
     if command == "/start":
         state["paused"] = False
-        tg.send(chat_id, HELP_TEXT)
+        tg.send(chat_id, HELP_TEXT, reply_markup=FILTER_KEYBOARD)
     elif command == "/help":
-        tg.send(chat_id, HELP_TEXT)
+        tg.send(chat_id, HELP_TEXT, reply_markup=FILTER_KEYBOARD)
     elif command == "/pauza":
         state["paused"] = True
         tg.send(chat_id, "⏸ Notifikace pozastaveny. Obnovíte příkazem /start.")
@@ -341,6 +359,43 @@ def handle_command(text, state, slots, tg):
         tg.send(chat_id, "Neznámý příkaz. Nápověda: /help")
 
 
+def validate_filters(data):
+    """Data z Mini App → seznam filtrů, nebo None při nevalidním vstupu."""
+    filters = data.get("filters") if isinstance(data, dict) else None
+    if not isinstance(filters, list) or len(filters) > 20:
+        return None
+    result = []
+    for f in filters:
+        if not isinstance(f, dict):
+            return None
+        days, start, end = f.get("days"), f.get("from"), f.get("to")
+        if (not isinstance(days, list) or not days
+                or not all(isinstance(d, int) and 0 <= d <= 6 for d in days)
+                or not isinstance(start, int) or not isinstance(end, int)
+                or not 0 <= start < end <= 24 * 60):
+            return None
+        result.append({"days": sorted(set(days)), "from": start, "to": end})
+    return result
+
+
+def handle_webapp_data(raw, state, tg):
+    """Uložení filtrů odeslaných z Mini App (nahrazuje celý seznam)."""
+    chat_id = state["chat_id"]
+    try:
+        new_filters = validate_filters(json.loads(raw))
+    except ValueError:
+        new_filters = None
+    if new_filters is None:
+        tg.send(chat_id, "⚠️ Neplatná data z aplikace filtrů.")
+        return
+    state["filters"] = new_filters
+    if new_filters:
+        active = "\n".join("• " + format_filter(f) for f in new_filters)
+        tg.send(chat_id, f"✅ Filtry uloženy:\n{active}")
+    else:
+        tg.send(chat_id, "✅ Filtry smazány — chodí notifikace na všechny časy.")
+
+
 def process_updates(state, slots, tg):
     if not tg.token:
         return
@@ -349,26 +404,38 @@ def process_updates(state, slots, tg):
         state["tg_offset"] = max(state["tg_offset"], update["update_id"] + 1)
         message = update.get("message") or {}
         text = message.get("text")
+        web_app = message.get("web_app_data") or {}
         chat_id = (message.get("chat") or {}).get("id")
-        if not text or chat_id is None:
+        if chat_id is None or not (text or web_app):
             continue
         if state["chat_id"] is None:
-            if text.strip().lower().startswith("/start"):
+            if text and text.strip().lower().startswith("/start"):
                 state["chat_id"] = chat_id  # bot se uzamkne na první chat
             else:
                 continue
         if chat_id != state["chat_id"]:
             continue  # cizí chaty ignorujeme
         try:
-            handle_command(text, state, slots, tg)
+            if web_app:
+                handle_webapp_data(web_app.get("data") or "", state, tg)
+            else:
+                handle_command(text, state, slots, tg)
         except Exception as exc:
             # pád tady by zablokoval posun offsetu a příkaz by se
             # přehrával každý běh znovu (crash-loop až 24 h)
-            print(f"Zpracování příkazu {text!r} selhalo: {exc}", file=sys.stderr)
+            print(f"Zpracování zprávy selhalo: {exc}", file=sys.stderr)
             tg.send(state["chat_id"], "⚠️ Příkaz se nepodařilo zpracovat.")
 
 
 # ---------------------------------------------------------------- hlavní běh
+
+def ensure_commands(state, tg):
+    """Jednorázově zaregistruje nabídku příkazů (menu po napsání /)."""
+    if state.get("commands_set") or not tg.token:
+        return
+    tg.call("setMyCommands", commands=BOT_COMMANDS)
+    state["commands_set"] = True
+
 
 def load_state():
     defaults = {
@@ -378,6 +445,7 @@ def load_state():
         "tg_offset": 0,
         "slots": {},
         "updated": None,
+        "commands_set": False,
     }
     if STATE_FILE.exists():
         defaults.update(json.loads(STATE_FILE.read_text()))
@@ -401,6 +469,7 @@ def main():
             sys.exit(message)  # bot už běžel — tichý dry-run by byl výpadek
         print(f"::warning::{message}")
 
+    ensure_commands(state, tg)
     events = fetch_events(now.astimezone(TZ).strftime("%Y-%m-%d"))
     slots = build_slots(events, now)
     print(f"Načteno {len(events)} termínů, {len(slots)} slotů, "
