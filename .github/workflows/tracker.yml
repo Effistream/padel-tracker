@@ -2,7 +2,8 @@ name: Padel tracker
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # offset minuty schválně mimo přetížené */5 (tomu GitHub dává nejnižší prioritu)
+    - cron: "2-57/5 * * * *"
   workflow_dispatch:
 
 permissions:
