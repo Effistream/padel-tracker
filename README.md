@@ -29,7 +29,9 @@ nativní cron začne běhat. Zastavení: zrušit jeho aktuální run v Actions.
 ## Ovládání bota
 
 Filtry nejpohodlněji nastavíte tlačítkem **⚙️ Filtry** u pole zprávy —
-otevře Mini App (hostovanou na GitHub Pages z `docs/`) s výběrem dnů
+otevře Mini App (hostovanou na GitHub Pages z `docs/` přes
+[pages.yml](.github/workflows/pages.yml) — přestaví se jen při změně
+`docs/`, ne při každém commitu stavu) s výběrem dnů
 a časů. Uložení nahradí celý seznam filtrů.
 
 Textové příkazy:
