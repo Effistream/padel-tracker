@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Padel tracker — hlídá volné kurty v Reenio a posílá Telegram notifikace.
+"""Padel tracker — hlídá volné kurty a posílá Telegram notifikace.
 
-Běží periodicky (GitHub Actions cron). Každý běh:
-  1. stáhne termíny na HORIZON_DAYS dopředu z veřejného Reenio API,
-  2. spočítá volnou kapacitu po 30min slotech,
+Sleduje dva areály: Císařskou louku (rezervační systém Reenio) a
+Padel Powers Smíchov (PadelOS). Běží periodicky (GitHub Actions cron).
+Každý běh:
+  1. stáhne volné kurty na HORIZON_DAYS dopředu z obou areálů,
+  2. spočítá, kolik kurtů jde na kterém 30min slotu reálně rezervovat,
   3. zpracuje Telegram příkazy (/filtr, /volno, /pauza, ...),
   4. porovná se snapshotem z minulého běhu a nahlásí uvolněné sloty,
   5. uloží nový stav do state.json (commituje workflow).
@@ -21,14 +23,30 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-BASE_URL = "https://areal-cisarska-louka.reenio.cz"
-RESERVATION_URL = f"{BASE_URL}/cs/service/hriste-padel-48086"
-RESOURCE_ID = 48086
-RESOURCE_TYPE = 3
-HORIZON_DAYS = 7  # jedno volání Term/List s viewMode=7-days
+HORIZON_DAYS = 7
 SLOT_MINUTES = 30
+# Kratší než hodinu kurt nikde nepronajmou, takže 30min okénko mezi dvěma
+# rezervacemi není volno. 120 min se nesleduje zvlášť — nepokrývá nic, co
+# by nebylo v 60 nebo 90.
+DURATIONS = (60, 90)
 TZ = ZoneInfo("Europe/Prague")
+KEY_FORMAT = "%Y-%m-%dT%H:%M"
+USER_AGENT = "padel-tracker (osobni notifikace volnych kurtu)"
 STATE_FILE = Path(__file__).parent / "state.json"
+
+CISARKA_URL = "https://areal-cisarska-louka.reenio.cz"
+CISARKA_RESERVATION_URL = f"{CISARKA_URL}/cs/service/hriste-padel-48086"
+CISARKA_RESOURCE_ID = 48086
+CISARKA_RESOURCE_TYPE = 3
+
+PADELOS_URL = "https://api.padelos.co"
+PADELOS_COMPANY = "217"  # Padel Powers
+PADELOS_VERSION = "2.4"
+SMICHOV_CLUB = "216927"
+SMICHOV_RESERVATION_URL = "https://player.padelos.co/company/217/bookings?locale=cs"
+# PadelOS otevírací dobu nevrací, jen volné termíny; 6–24 odpovídá tomu,
+# co klub nabízí (nejdřívější start 6:00, nejpozdější konec 24:00)
+SMICHOV_HOURS = (6, 24)
 
 WEBAPP_URL = "https://effistream.github.io/padel-tracker/"
 FILTER_KEYBOARD = {
@@ -51,7 +69,8 @@ DAY_TOKENS = {"po": 0, "ut": 1, "st": 2, "ct": 3, "pa": 4, "so": 5, "ne": 6}
 DAY_ALIASES = {"vikend": [5, 6], "vsedni": [0, 1, 2, 3, 4]}
 
 HELP_TEXT = (
-    "🎾 Padel tracker — hlídám uvolněné kurty (Císařská louka).\n\n"
+    "🎾 Padel tracker — hlídám uvolněné kurty na Císařské louce "
+    "a v Padel Powers Smíchov.\n\n"
     "Filtry nejpohodlněji nastavíte tlačítkem ⚙️ Filtry dole u pole zprávy.\n\n"
     "Příkazy:\n"
     "/filtr po-pa 16:00-22:00 — přidat časový filtr notifikací\n"
@@ -68,33 +87,33 @@ HELP_TEXT = (
 )
 
 
-# ---------------------------------------------------------------- Reenio API
+def parse_utc(iso):
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
-def fetch_events(date_str):
+
+# ------------------------------------------------- Císařská louka (Reenio)
+
+def fetch_cisarka_events(date_str):
     """Stáhne termíny od date_str na 7 dní dopředu."""
     params = urllib.parse.urlencode({
         "date": date_str,
         "viewMode": "7-days",
         "page": "0",
-        "filter.resource[0].id": str(RESOURCE_ID),
-        "filter.resource[0].type": str(RESOURCE_TYPE),
+        "filter.resource[0].id": str(CISARKA_RESOURCE_ID),
+        "filter.resource[0].type": str(CISARKA_RESOURCE_TYPE),
         "includeColors": "false",
         "findNearestAvailable": "false",
     })
     req = urllib.request.Request(
-        f"{BASE_URL}/cs/api/Term/List",
+        f"{CISARKA_URL}/cs/api/Term/List",
         data=params.encode(),
-        headers={"User-Agent": "padel-tracker (osobni notifikace volnych kurtu)"},
+        headers={"User-Agent": USER_AGENT},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         payload = json.load(resp)
     if payload.get("status") != "OK":
         raise RuntimeError(f"Reenio API vrátilo status {payload.get('status')!r}")
     return payload["data"]["events"]
-
-
-def parse_utc(iso):
-    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
 def parse_duration(text):
@@ -106,13 +125,17 @@ def parse_duration(text):
         return timedelta(0)
 
 
-def build_slots(events, now):
-    """Mapa {"YYYY-MM-DDTHH:MM": počet volných kurtů} po 30min slotech.
+def build_cisarka_slots(events, now):
+    """Mapa {"YYYY-MM-DDTHH:MM": počet rezervovatelných kurtů} po 30 min.
 
-    Počítá jen sloty, které lze ještě rezervovat (Reenio uzavírá rezervace
-    reservationDueDate před začátkem slotu); klíče jsou v čase Europe/Prague.
+    Volno se počítá jako kapacita − překrývající se rezervace, ale do mapy
+    jde jen tam, kde na slot navazuje celých 60 nebo 90 minut volna uvnitř
+    jednoho termínu (přes hranici dvou termínů rezervace nejde). Jinde
+    zůstane nula — a právě přechod z nuly se hlásí jako uvolnění.
+    Klíče jsou v čase Europe/Prague.
     """
     slots = {}
+    step = timedelta(minutes=SLOT_MINUTES)
     for event in events:
         if not event.get("isVisible", True) or not event.get("isEnabled", True):
             continue
@@ -121,21 +144,148 @@ def build_slots(events, now):
             continue
         start = parse_utc(event["start"])
         end = parse_utc(event["end"])
-        due = parse_duration(event.get("reservationDueDate") or "")
+        # Reenio uzavírá rezervace reservationDueDate před začátkem slotu
+        cutoff = now + parse_duration(event.get("reservationDueDate") or "")
         reservations = [
             (parse_utc(r["start"]), parse_utc(r["end"]), r.get("capacity", 1))
             for r in event.get("reservations") or []
         ]
+        free = {}
         slot = start
-        step = timedelta(minutes=SLOT_MINUTES)
         while slot < end:
             slot_end = slot + step
-            if slot > now + due:
-                occupied = sum(c for s, e, c in reservations if s < slot_end and e > slot)
-                key = slot.astimezone(TZ).strftime("%Y-%m-%dT%H:%M")
-                slots[key] = slots.get(key, 0) + max(0, capacity - occupied)
+            occupied = sum(c for s, e, c in reservations if s < slot_end and e > slot)
+            free[slot] = max(0, capacity - occupied)
             slot = slot_end
+
+        bookable = set()
+        for begin in free:
+            if begin <= cutoff:
+                continue
+            for minutes in DURATIONS:
+                window = [begin + i * step for i in range(minutes // SLOT_MINUTES)]
+                # poslední půlhodina v mapě = rezervace se vejde do termínu
+                if window[-1] in free and all(free[t] > 0 for t in window):
+                    bookable.update(window)
+
+        for slot, count in free.items():
+            if slot <= cutoff:
+                continue
+            key = slot.astimezone(TZ).strftime(KEY_FORMAT)
+            slots[key] = slots.get(key, 0) + (count if slot in bookable else 0)
     return slots
+
+
+def cisarka_slots(now):
+    events = fetch_cisarka_events(now.astimezone(TZ).strftime("%Y-%m-%d"))
+    return build_cisarka_slots(events, now)
+
+
+# --------------------------------------------- Padel Powers Smíchov (PadelOS)
+
+def fetch_smichov_day(date_str):
+    """Volné kurty na Smíchově pro jeden den — PadelOS umí jen po dnech."""
+    body = json.dumps({
+        "date": date_str,
+        "sport": "padel",
+        "courtType": "",
+        "courtSize": "",
+        "courtTurf": "",
+        "courtFeature": "",
+        "searchTerm": "",
+        "limit": "",
+        "offset": "",
+        "type": "",
+    }).encode()
+    req = urllib.request.Request(
+        f"{PADELOS_URL}/customers/searchByDate",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept-Language": "cs",
+            "User-Agent": USER_AGENT,
+            "version": PADELOS_VERSION,
+            "x-clubos-channel": "CLUBOS-WEB",
+            "x-clubos-domain": "PADELOSCO",
+            "x-clubos-company": PADELOS_COMPANY,
+            "x-clubos-club-info": SMICHOV_CLUB,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.load(resp)
+    if not payload.get("success"):
+        raise RuntimeError("PadelOS API nevrátilo success")
+    for club in payload.get("data") or []:
+        if club.get("id") == SMICHOV_CLUB:
+            return club
+    raise RuntimeError(f"PadelOS API nevrátilo klub {SMICHOV_CLUB}")
+
+
+def smichov_grid(today):
+    """Všechny 30min sloty v otevírací době na celém horizontu.
+
+    Potřeba kvůli nulám: PadelOS vrací jen to, co je volné, ale uvolnění
+    se pozná jako přechod 0 → volno. Slot, o kterém nic nevíme, by se
+    nenahlásil nikdy.
+    """
+    step = timedelta(minutes=SLOT_MINUTES)
+    opening, closing = SMICHOV_HOURS
+    for offset in range(HORIZON_DAYS):
+        midnight = datetime.combine(today + timedelta(days=offset), datetime.min.time())
+        slot = midnight + timedelta(hours=opening)
+        close = midnight + timedelta(hours=closing)
+        while slot < close:
+            yield slot.strftime(KEY_FORMAT)
+            slot += step
+
+
+def smichov_slots(now):
+    """Mapa slotů pro Smíchov — stejná sémantika jako u Císařské louky.
+
+    PadelOS nevrací rezervace, ale rovnou volné kurty pro každou délku.
+    Pokrytí 60 a 90 minut se sjednocuje: ve večerní špičce klub kratší
+    než 90min rezervaci vůbec nenabízí, takže šedesátiminutový seznam
+    sám o sobě by ty termíny zahodil.
+    """
+    step = timedelta(minutes=SLOT_MINUTES)
+    today = now.astimezone(TZ).date()
+    courts = {}
+    for offset in range(HORIZON_DAYS):
+        club = fetch_smichov_day((today + timedelta(days=offset)).isoformat())
+        for block in club.get("availability") or []:
+            minutes = int(block.get("duration") or 0)
+            if minutes not in DURATIONS:
+                continue
+            for slot in block.get("slots") or []:
+                begin = datetime.strptime(
+                    f"{slot['date']} {slot['startTime']}", "%Y-%m-%d %H:%M"
+                )
+                ids = {court["id"] for court in slot.get("courts") or []}
+                for i in range(minutes // SLOT_MINUTES):
+                    key = (begin + i * step).strftime(KEY_FORMAT)
+                    courts.setdefault(key, set()).update(ids)
+
+    slots = {key: 0 for key in smichov_grid(today)}
+    for key, ids in courts.items():
+        slots[key] = len(ids)
+    now_key = now.astimezone(TZ).strftime(KEY_FORMAT)
+    return {key: count for key, count in slots.items() if key > now_key}
+
+
+VENUES = [
+    {
+        "key": "cisarka",
+        "name": "Císařská louka",
+        "url": CISARKA_RESERVATION_URL,
+        "fetch": cisarka_slots,
+    },
+    {
+        "key": "smichov",
+        "name": "Padel Powers Smíchov",
+        "url": SMICHOV_RESERVATION_URL,
+        "fetch": smichov_slots,
+    },
+]
 
 
 # ---------------------------------------------------------------- filtry
@@ -214,7 +364,7 @@ def format_filter(f):
 def slot_passes(key, filters):
     if not filters:
         return True
-    dt = datetime.strptime(key, "%Y-%m-%dT%H:%M")
+    dt = datetime.strptime(key, KEY_FORMAT)
     minutes = dt.hour * 60 + dt.minute
     return any(
         dt.weekday() in f["days"] and f["from"] <= minutes < f["to"] for f in filters
@@ -240,7 +390,7 @@ def merge_intervals(keys):
     intervals = []
     step = timedelta(minutes=SLOT_MINUTES)
     for key in sorted(keys):
-        dt = datetime.strptime(key, "%Y-%m-%dT%H:%M")
+        dt = datetime.strptime(key, KEY_FORMAT)
         if intervals and intervals[-1][1] == dt:
             intervals[-1][1] = dt + step
         else:
@@ -248,39 +398,70 @@ def merge_intervals(keys):
     return intervals
 
 
-def format_freed_message(freed):
+def expand_to_free_run(keys, slots):
+    """Uvolněné sloty → celé navazující volné úseky.
+
+    Z nuly přeskočí jen ta půlhodina, kterou někdo zrušil, ale hrát se dá
+    celé okno kolem ní. Bez roztažení by zpráva hlásila "17:00–17:30",
+    což je čas, na který se rezervace ani vzít nedá.
+    """
+    step = timedelta(minutes=SLOT_MINUTES)
+    grown = set(keys)
+    for key in keys:
+        for direction in (-1, 1):
+            slot = datetime.strptime(key, KEY_FORMAT)
+            while True:
+                slot += direction * step
+                neighbour = slot.strftime(KEY_FORMAT)
+                if slots.get(neighbour, 0) <= 0:
+                    break
+                grown.add(neighbour)
+    return grown
+
+
+def format_freed_message(freed_by_venue):
+    """[(areál, uvolněné sloty, všechny sloty)] → zpráva se sekcí na areál."""
     lines = ["🎾 Uvolnilo se místo na padelu!"]
-    intervals = merge_intervals(freed)
-    for start, end in intervals:
-        keys = []
-        t = start
-        while t < end:
-            keys.append(t.strftime("%Y-%m-%dT%H:%M"))
-            t += timedelta(minutes=SLOT_MINUTES)
-        count = min(freed[k] for k in keys)
-        lines.append(
-            f"• {format_day(start)} {start:%H:%M}–{end:%H:%M} ({czech_courts(count)})"
-        )
-    lines.append(f"\nRezervace: {RESERVATION_URL}")
+    for venue, freed, slots in freed_by_venue:
+        lines.append(f"\n{venue['name']}:")
+        for start, end in merge_intervals(expand_to_free_run(freed, slots)):
+            keys = []
+            t = start
+            while t < end:
+                keys.append(t.strftime(KEY_FORMAT))
+                t += timedelta(minutes=SLOT_MINUTES)
+            count = min(slots[k] for k in keys)
+            lines.append(
+                f"• {format_day(start)} {start:%H:%M}–{end:%H:%M} ({czech_courts(count)})"
+            )
+        lines.append(f"Rezervace: {venue['url']}")
     return "\n".join(lines)
 
 
-def format_overview(slots, filters):
-    free_keys = [k for k, v in slots.items() if v > 0 and slot_passes(k, filters)]
-    if not free_keys:
+def format_overview(slots_by_venue, filters):
+    lines = ["🎾 Volné kurty (7 dní):"]
+    anything = False
+    for venue in VENUES:
+        slots = slots_by_venue.get(venue["key"]) or {}
+        free_keys = [k for k, v in slots.items() if v > 0 and slot_passes(k, filters)]
+        lines.append(f"\n{venue['name']}:")
+        if not free_keys:
+            lines.append("— nic volného")
+            continue
+        anything = True
+        by_day = {}
+        for start, end in merge_intervals(free_keys):
+            by_day.setdefault(start.date(), []).append(f"{start:%H:%M}–{end:%H:%M}")
+        for day in sorted(by_day):
+            dt = datetime.combine(day, datetime.min.time())
+            lines.append(f"{format_day(dt)}: {', '.join(by_day[day])}")
+        lines.append(f"Rezervace: {venue['url']}")
+    if not anything:
         return "Žádné volné sloty v následujících 7 dnech" + (
             " (v rámci filtrů)." if filters else "."
         )
-    by_day = {}
-    for start, end in merge_intervals(free_keys):
-        by_day.setdefault(start.date(), []).append(f"{start:%H:%M}–{end:%H:%M}")
-    lines = ["🎾 Volné kurty (7 dní):"]
-    for day in sorted(by_day):
-        dt = datetime.combine(day, datetime.min.time())
-        lines.append(f"{format_day(dt)}: {', '.join(by_day[day])}")
     if filters:
         lines.append("\n(filtrováno — /filtry pro přehled)")
-    lines.append(f"Rezervace: {RESERVATION_URL}")
     return "\n".join(lines)
 
 
@@ -318,7 +499,7 @@ class Telegram:
             print(f"sendMessage selhalo: {exc}", file=sys.stderr)
 
 
-def handle_command(text, state, slots, tg):
+def handle_command(text, state, slots_by_venue, tg):
     """Zpracuje jeden příkaz od vlastníka chatu a odpoví."""
     chat_id = state["chat_id"]
     command, _, args = text.strip().partition(" ")
@@ -354,7 +535,7 @@ def handle_command(text, state, slots, tg):
         state["filters"] = []
         tg.send(chat_id, "🗑 Filtry smazány — chodí notifikace na všechny časy.")
     elif command == "/volno":
-        tg.send(chat_id, format_overview(slots, state["filters"]))
+        tg.send(chat_id, format_overview(slots_by_venue, state["filters"]))
     else:
         tg.send(chat_id, "Neznámý příkaz. Nápověda: /help")
 
@@ -396,7 +577,7 @@ def handle_webapp_data(raw, state, tg):
         tg.send(chat_id, "✅ Filtry smazány — chodí notifikace na všechny časy.")
 
 
-def process_updates(state, slots, tg):
+def process_updates(state, slots_by_venue, tg):
     if not tg.token:
         return
     updates = tg.call("getUpdates", offset=state["tg_offset"], timeout=0)
@@ -419,7 +600,7 @@ def process_updates(state, slots, tg):
             if web_app:
                 handle_webapp_data(web_app.get("data") or "", state, tg)
             else:
-                handle_command(text, state, slots, tg)
+                handle_command(text, state, slots_by_venue, tg)
         except Exception as exc:
             # pád tady by zablokoval posun offsetu a příkaz by se
             # přehrával každý běh znovu (crash-loop až 24 h)
@@ -443,12 +624,18 @@ def load_state():
         "paused": False,
         "filters": [],
         "tg_offset": 0,
-        "slots": {},
+        "venues": {},
         "updated": None,
         "commands_set": False,
     }
     if STATE_FILE.exists():
         defaults.update(json.loads(STATE_FILE.read_text()))
+    # migrace z doby jednoho areálu: ploché "slots" byly Císařská louka
+    legacy = defaults.pop("slots", None)
+    if legacy and not defaults["venues"]:
+        defaults["venues"] = {VENUES[0]["key"]: legacy}
+    for venue in VENUES:
+        defaults["venues"].setdefault(venue["key"], {})
     return defaults
 
 
@@ -456,6 +643,17 @@ def save_state(state):
     STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
     )
+
+
+def keep_zero_baselines(old_slots, slots, now):
+    """Nuly slotů, které z feedu dočasně zmizely (deaktivovaný termín,
+    výpadek API), zůstávají — jinak by se návrat s volnou kapacitou
+    nenahlásil."""
+    now_key = now.astimezone(TZ).strftime(KEY_FORMAT)
+    for key, count in old_slots.items():
+        if count == 0 and key > now_key and key not in slots:
+            slots[key] = 0
+    return slots
 
 
 def main():
@@ -470,33 +668,44 @@ def main():
         print(f"::warning::{message}")
 
     ensure_commands(state, tg)
-    events = fetch_events(now.astimezone(TZ).strftime("%Y-%m-%d"))
-    slots = build_slots(events, now)
-    print(f"Načteno {len(events)} termínů, {len(slots)} slotů, "
-          f"{sum(1 for v in slots.values() if v > 0)} s volnou kapacitou.")
 
-    process_updates(state, slots, tg)
+    fresh = {}
+    for venue in VENUES:
+        try:
+            slots = venue["fetch"](now)
+        except Exception as exc:
+            # výpadek jednoho areálu nesmí přepsat jeho snapshot — bez
+            # starých nul by se uvolnění po návratu už nikdy nenahlásilo
+            print(f"::warning::{venue['name']}: načtení selhalo: {exc}", file=sys.stderr)
+            continue
+        fresh[venue["key"]] = slots
+        print(f"{venue['name']}: {len(slots)} slotů, "
+              f"{sum(1 for v in slots.values() if v > 0)} s volnou kapacitou.")
 
-    old_slots = state["slots"]
-    freed = {
-        key: count
-        for key, count in slots.items()
-        if count > 0 and old_slots.get(key) == 0 and slot_passes(key, state["filters"])
-    }
-    if freed and old_slots:
-        message = format_freed_message(freed)
+    process_updates(state, {**state["venues"], **fresh}, tg)
+
+    freed_by_venue = []
+    for venue in VENUES:
+        slots = fresh.get(venue["key"])
+        if slots is None:
+            continue
+        old_slots = state["venues"].get(venue["key"]) or {}
+        freed = {
+            key: count
+            for key, count in slots.items()
+            if count > 0 and old_slots.get(key) == 0
+            and slot_passes(key, state["filters"])
+        }
+        if freed and old_slots:
+            freed_by_venue.append((venue, freed, slots))
+        state["venues"][venue["key"]] = keep_zero_baselines(old_slots, slots, now)
+
+    if freed_by_venue:
+        message = format_freed_message(freed_by_venue)
         print(message)
         if state["chat_id"] and not state["paused"]:
             tg.send(state["chat_id"], message)
 
-    # 0-baseline slotů, které z feedu dočasně zmizely (deaktivovaný event,
-    # výpadek API), zůstává — jinak by se návrat s volnou kapacitou nenahlásil
-    now_key = now.astimezone(TZ).strftime("%Y-%m-%dT%H:%M")
-    for key, count in old_slots.items():
-        if count == 0 and key > now_key and key not in slots:
-            slots[key] = 0
-
-    state["slots"] = slots
     state["updated"] = now.astimezone(TZ).isoformat(timespec="seconds")
     save_state(state)
 
